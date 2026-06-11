@@ -112,8 +112,8 @@ function createApp() {
   return app;
 }
 
-function signAccessToken(sub = 9) {
-  return jwt.sign({ sub }, privateKey, {
+function signAccessToken(sub = 9, role = "stylist") {
+  return jwt.sign({ sub, role }, privateKey, {
     algorithm: "RS256",
     issuer: "salon-platform.auth",
     audience: "salon-platform.api",

@@ -23,6 +23,10 @@ function intEnv(name) {
   return parsed;
 }
 
+function optionalEnv(name, fallback = "") {
+  return process.env[name] || fallback;
+}
+
 module.exports = {
   port: intEnv("PORT"),
   nodeEnv: requiredEnv("NODE_ENV"),
@@ -33,4 +37,5 @@ module.exports = {
   jwtIssuer: requiredEnv("JWT_ISSUER"),
   jwtAudience: requiredEnv("JWT_AUDIENCE"),
   corsAllowedOrigins: csvEnv("CORS_ALLOWED_ORIGINS"),
+  bookingServiceUrl: optionalEnv("BOOKING_SERVICE_URL", "http://localhost:4003"),
 };

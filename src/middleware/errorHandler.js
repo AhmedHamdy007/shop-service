@@ -41,6 +41,14 @@ function errorHandler(err, req, res, next) {
     });
   }
 
+  if (Number.isInteger(err.status) && err.status >= 400 && err.status < 600) {
+    return res.status(err.status).json({
+      success: false,
+      error: err.message,
+      request_id: req.id,
+    });
+  }
+
   return res.status(500).json({
     success: false,
     error: "Internal server error",

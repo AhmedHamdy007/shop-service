@@ -17,9 +17,23 @@ const {
 } = require("../services/imageService");
 
 const router = express.Router();
+const INTER_SERVICE_TIMEOUT_MS = 5000;
+
+async function fetchWithTimeout(url, options = {}) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), INTER_SERVICE_TIMEOUT_MS);
+  try {
+    return await fetch(url, {
+      ...options,
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
 
 async function getCurrentUser(req) {
-  const upstream = await fetch(`${config.authServiceUrl}/users/me`, {
+  const upstream = await fetchWithTimeout(`${config.authServiceUrl}/users/me`, {
     method: "GET",
     headers: {
       authorization: req.headers.authorization || "",
@@ -90,7 +104,7 @@ router.patch(
       });
     }
 
-    const updated = await updateUserAvatar(user.id, user.role, req.file, {
+    const updated = await updateUserAvatar(user.id, req.user.role, req.file, {
       authorization: req.headers.authorization || "",
     });
 
@@ -108,7 +122,7 @@ router.post(
   "/stylist/portfolio",
   ...withSingleImage("photo", async (req, res) => {
     const user = await getCurrentUser(req);
-    if (!user || user.role !== "stylist") {
+    if (!user || req.user.role !== "stylist") {
       return res.status(403).json({
         success: false,
         error: "Stylist role required",
@@ -136,7 +150,7 @@ router.post(
 router.delete("/stylist/portfolio/:photoId", requireAuth, async (req, res) => {
   try {
     const user = await getCurrentUser(req);
-    if (!user || user.role !== "stylist") {
+    if (!user || req.user.role !== "stylist") {
       return res.status(403).json({
         success: false,
         error: "Stylist role required",
@@ -165,7 +179,7 @@ router.patch(
   "/stylist/portfolio/:photoId/replace",
   ...withSingleImage("photo", async (req, res) => {
     const user = await getCurrentUser(req);
-    if (!user || user.role !== "stylist") {
+    if (!user || req.user.role !== "stylist") {
       return res.status(403).json({
         success: false,
         error: "Stylist role required",
@@ -187,7 +201,7 @@ router.patch(
 router.patch("/stylist/portfolio/reorder", requireAuth, async (req, res) => {
   try {
     const user = await getCurrentUser(req);
-    if (!user || user.role !== "stylist") {
+    if (!user || req.user.role !== "stylist") {
       return res.status(403).json({
         success: false,
         error: "Stylist role required",
@@ -224,7 +238,7 @@ router.patch(
   "/owner/salon-cover",
   ...withSingleImage("cover", async (req, res) => {
     const user = await getCurrentUser(req);
-    if (!user || user.role !== "owner") {
+    if (!user || req.user.role !== "owner") {
       return res.status(403).json({
         success: false,
         error: "Owner role required",
@@ -262,10 +276,10 @@ router.delete("/internal/users/:userId/images", requireAuth, async (req, res) =>
       });
     }
 
-    if (user.role === "stylist") {
+    if (req.user.role === "stylist") {
       await deleteStylistAllImages(user.id);
       if (user.avatar?.publicId) await deleteImage(user.avatar.publicId);
-    } else if (user.role === "owner") {
+    } else if (req.user.role === "owner") {
       await deleteOwnerImages(user.id, user.avatar?.publicId);
     } else if (user.avatar?.publicId) {
       await deleteImage(user.avatar.publicId);

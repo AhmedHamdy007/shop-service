@@ -3,6 +3,9 @@ const crypto = require("crypto");
 
 function rowToProfile(row) {
   if (!row) return null;
+  const matchedServices = Array.isArray(row.matched_services)
+    ? row.matched_services
+    : [];
   return {
     id: row.id,
     userId: row.user_id,
@@ -20,6 +23,7 @@ function rowToProfile(row) {
     instagramHandle: row.instagram_handle,
     tiktokHandle: row.tiktok_handle,
     isPublic: row.is_public,
+    depositRequired: Boolean(row.deposit_required),
     shopId: row.shop_id,
     shopName: row.shop_name,
     shopSlug: row.shop_slug,
@@ -27,6 +31,10 @@ function rowToProfile(row) {
     shopCity: row.shop_city,
     shopCountry: row.shop_country,
     staffLevel: row.staff_level,
+    stripeAccountId: row.stripe_account_id || null,
+    stripeOnboardingDone: Boolean(row.stripe_onboarding_done),
+    payoutsEnabled: Boolean(row.payouts_enabled),
+    chargesEnabled: Boolean(row.charges_enabled),
     portfolioCount:
       row.portfolio_count === undefined || row.portfolio_count === null
         ? undefined
@@ -35,6 +43,16 @@ function rowToProfile(row) {
       row.service_count === undefined || row.service_count === null
         ? undefined
         : Number(row.service_count),
+    matchedServices: matchedServices.map((service) => ({
+      id: service.id,
+      name: service.name,
+      category: service.category || null,
+      price: service.price === undefined || service.price === null ? null : Number(service.price),
+      durationMinutes:
+        service.durationMinutes === undefined || service.durationMinutes === null
+          ? null
+          : Number(service.durationMinutes),
+    })),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -146,6 +164,7 @@ async function upsertByUserId(userId, patch) {
 
 async function listPublicProfiles({
   q = null,
+  serviceName = null,
   city = null,
   shopId = null,
   staffLevel = null,
@@ -165,12 +184,124 @@ async function listPublicProfiles({
     name_asc: "COALESCE(sp.display_name, '') ASC, sp.created_at DESC",
   };
   const orderBy = sortMap[sort] || sortMap.newest;
+  let serviceSearchRankSelect = "0 AS service_match_rank";
+  let matchedServicesSelect = "'[]'::json AS matched_services";
+
+  if (serviceName) {
+    params.push(serviceName);
+    const serviceNameIndex = params.length;
+    filters.push(
+      `EXISTS (
+        SELECT 1
+        FROM stylist_service_offerings so
+        INNER JOIN shop_services svc
+          ON svc.id = so.service_id
+         AND svc.is_active = true
+        WHERE so.stylist_user_id = sp.user_id
+          AND so.shop_id = ss.shop_id
+          AND so.is_active = true
+          AND svc.name ILIKE $${serviceNameIndex}
+      )`
+    );
+    serviceSearchRankSelect = `CASE WHEN EXISTS (
+              SELECT 1
+              FROM stylist_service_offerings so
+              INNER JOIN shop_services svc
+                ON svc.id = so.service_id
+               AND svc.is_active = true
+              WHERE so.stylist_user_id = sp.user_id
+                AND so.shop_id = ss.shop_id
+                AND so.is_active = true
+                AND svc.name ILIKE $${serviceNameIndex}
+            ) THEN 1 ELSE 0 END AS service_match_rank`;
+    matchedServicesSelect = `COALESCE((
+              SELECT json_agg(service_row)
+              FROM (
+                SELECT
+                  svc.id,
+                  svc.name,
+                  svc.category,
+                  COALESCE(so.custom_price, svc.price) AS price,
+                  COALESCE(so.custom_duration_minutes, svc.duration_minutes) AS "durationMinutes"
+                FROM stylist_service_offerings so
+                INNER JOIN shop_services svc
+                  ON svc.id = so.service_id
+                 AND svc.is_active = true
+                WHERE so.stylist_user_id = sp.user_id
+                  AND so.shop_id = ss.shop_id
+                  AND so.is_active = true
+                  AND svc.name ILIKE $${serviceNameIndex}
+                ORDER BY svc.name ASC
+                LIMIT 4
+              ) service_row
+            ), '[]'::json) AS matched_services`;
+  }
 
   if (q) {
     params.push(`%${q}%`);
+    const searchIndex = params.length;
     filters.push(
-      `(sp.display_name ILIKE $${params.length} OR sp.bio ILIKE $${params.length} OR sp.specialties ILIKE $${params.length})`
+      `(sp.display_name ILIKE $${searchIndex}
+        OR sp.bio ILIKE $${searchIndex}
+        OR sp.specialties ILIKE $${searchIndex}
+        OR EXISTS (
+          SELECT 1
+          FROM stylist_service_offerings so
+          INNER JOIN shop_services svc
+            ON svc.id = so.service_id
+           AND svc.is_active = true
+          WHERE so.stylist_user_id = sp.user_id
+            AND so.shop_id = ss.shop_id
+            AND so.is_active = true
+            AND (
+              svc.name ILIKE $${searchIndex}
+              OR svc.category ILIKE $${searchIndex}
+              OR svc.description ILIKE $${searchIndex}
+            )
+        ))`
     );
+    if (!serviceName) {
+      serviceSearchRankSelect = `CASE WHEN EXISTS (
+              SELECT 1
+              FROM stylist_service_offerings so
+              INNER JOIN shop_services svc
+                ON svc.id = so.service_id
+               AND svc.is_active = true
+              WHERE so.stylist_user_id = sp.user_id
+                AND so.shop_id = ss.shop_id
+                AND so.is_active = true
+                AND (
+                  svc.name ILIKE $${searchIndex}
+                  OR svc.category ILIKE $${searchIndex}
+                  OR svc.description ILIKE $${searchIndex}
+                )
+            ) THEN 1 ELSE 0 END AS service_match_rank`;
+      matchedServicesSelect = `COALESCE((
+              SELECT json_agg(service_row)
+              FROM (
+                SELECT
+                  svc.id,
+                  svc.name,
+                  svc.category,
+                  COALESCE(so.custom_price, svc.price) AS price,
+                  COALESCE(so.custom_duration_minutes, svc.duration_minutes) AS "durationMinutes"
+                FROM stylist_service_offerings so
+                INNER JOIN shop_services svc
+                  ON svc.id = so.service_id
+                 AND svc.is_active = true
+                WHERE so.stylist_user_id = sp.user_id
+                  AND so.shop_id = ss.shop_id
+                  AND so.is_active = true
+                  AND (
+                    svc.name ILIKE $${searchIndex}
+                    OR svc.category ILIKE $${searchIndex}
+                    OR svc.description ILIKE $${searchIndex}
+                  )
+                ORDER BY svc.name ASC
+                LIMIT 4
+              ) service_row
+            ), '[]'::json) AS matched_services`;
+    }
   }
   if (city) {
     params.push(city);
@@ -208,14 +339,16 @@ async function listPublicProfiles({
               WHERE so.stylist_user_id = sp.user_id
                 AND so.shop_id = ss.shop_id
                 AND so.is_active = true
-            ) AS service_count
+            ) AS service_count,
+            ${serviceSearchRankSelect},
+            ${matchedServicesSelect}
      FROM stylist_profiles sp
      INNER JOIN shop_staff ss
        ON ss.user_id = sp.user_id
      INNER JOIN shops sh
        ON sh.id = ss.shop_id
      WHERE ${filters.join(" AND ")}
-     ORDER BY ${orderBy}
+     ORDER BY service_match_rank DESC, ${orderBy}
      LIMIT $${params.length}`,
     params
   );
@@ -304,11 +437,82 @@ async function listProfilesByUserIds(userIds = []) {
   return result.rows.map(rowToProfile);
 }
 
+async function searchProfilesForInvite({ q = null, limit = 20, excludeActiveShopId = null } = {}) {
+  const params = [];
+  const filters = [];
+  const normalizedLimit = Number.isInteger(limit) ? Math.min(Math.max(limit, 1), 50) : 20;
+
+  if (q) {
+    params.push(`%${String(q).trim()}%`);
+    const searchIndex = params.length;
+    filters.push(
+      `(sp.display_name ILIKE $${searchIndex}
+        OR sp.bio ILIKE $${searchIndex}
+        OR sp.specialties ILIKE $${searchIndex}
+        OR sp.user_id::text ILIKE $${searchIndex})`
+    );
+  }
+
+  if (excludeActiveShopId) {
+    params.push(String(excludeActiveShopId));
+    const shopIndex = params.length;
+    filters.push(
+      `NOT EXISTS (
+        SELECT 1
+        FROM shop_staff current_staff
+        WHERE current_staff.user_id = sp.user_id
+          AND current_staff.shop_id = $${shopIndex}
+          AND current_staff.status = 'active'
+      )`
+    );
+  }
+
+  params.push(normalizedLimit);
+
+  const result = await query(
+    `SELECT sp.*,
+            ss.shop_id,
+            ss.staff_level,
+            sh.name AS shop_name,
+            sh.slug AS shop_slug,
+            sh.address_line1 AS shop_address_line1,
+            sh.city AS shop_city,
+            sh.country AS shop_country,
+            (
+              SELECT COUNT(*)::int
+              FROM portfolio_posts pp
+              WHERE pp.stylist_user_id = sp.user_id
+                AND pp.is_published = true
+            ) AS portfolio_count,
+            (
+              SELECT COUNT(*)::int
+              FROM stylist_service_offerings so
+              WHERE so.stylist_user_id = sp.user_id
+                AND so.is_active = true
+                AND (ss.shop_id IS NULL OR so.shop_id = ss.shop_id)
+            ) AS service_count
+     FROM stylist_profiles sp
+     LEFT JOIN shop_staff ss
+       ON ss.user_id = sp.user_id
+      AND ss.status = 'active'
+     LEFT JOIN shops sh
+       ON sh.id = ss.shop_id
+      AND sh.is_active = true
+     ${filters.length ? `WHERE ${filters.join(" AND ")}` : ""}
+     ORDER BY COALESCE(sp.display_name, '') ASC, sp.created_at DESC
+     LIMIT $${params.length}`,
+    params
+  );
+
+  return result.rows.map(rowToProfile);
+}
+
 module.exports = {
   getByUserId,
   getPublicProfileByIdentifier,
   listPublicProfiles,
   listPublicProfilesByShopId,
   listProfilesByUserIds,
+  searchProfilesForInvite,
   upsertByUserId,
 };

@@ -10,6 +10,21 @@ const { isValidServiceCatalogKey } = require("../catalog/serviceCatalog");
 
 const STAFF_LEVELS = ["stylist", "senior_stylist"];
 const STAFF_STATUSES = ["active", "inactive"];
+const MALAYSIAN_PAYOUT_BANKS = [
+  "Maybank",
+  "CIMB",
+  "RHB",
+  "Hong Leong",
+  "Public Bank",
+  "AmBank",
+  "Bank Islam",
+  "Bank Rakyat",
+  "BSN",
+  "OCBC",
+  "Standard Chartered",
+  "HSBC",
+  "Alliance Bank",
+];
 
 function validateString(name, value, { required = false, maxLength = 255 } = {}) {
   if (value === undefined || value === null || value === "") {
@@ -33,6 +48,10 @@ function validateString(name, value, { required = false, maxLength = 255 } = {})
 
 function validateOptionalString(name, value, { maxLength = 255 } = {}) {
   return validateString(name, value, { required: false, maxLength });
+}
+
+function validateRequiredString(name, value, { maxLength = 255 } = {}) {
+  return validateString(name, value, { required: true, maxLength });
 }
 
 function validatePrice(value) {
@@ -222,8 +241,49 @@ function normalizeServicePayload(body) {
   };
 }
 
+function validateMalaysianBank(value) {
+  const bankName = validateRequiredString("bankName", value, { maxLength: 100 });
+  const matched = MALAYSIAN_PAYOUT_BANKS.find(
+    (bank) => bank.toLowerCase() === bankName.toLowerCase()
+  );
+  if (!matched) {
+    throw new ValidationError("bankName must be an approved Malaysian bank", "bankName");
+  }
+  return matched;
+}
+
+function validateDigitString(name, value, { exactLength = null, minLength = null, maxLength = null } = {}) {
+  const normalized = validateRequiredString(name, value, { maxLength: maxLength || exactLength || 64 });
+  if (!/^\d+$/.test(normalized)) {
+    throw new ValidationError(`${name} must contain digits only`, name);
+  }
+  if (exactLength !== null && normalized.length !== exactLength) {
+    throw new ValidationError(`${name} must be exactly ${exactLength} digits`, name);
+  }
+  if (minLength !== null && normalized.length < minLength) {
+    throw new ValidationError(`${name} must be at least ${minLength} digits`, name);
+  }
+  if (maxLength !== null && normalized.length > maxLength) {
+    throw new ValidationError(`${name} must be at most ${maxLength} digits`, name);
+  }
+  return normalized;
+}
+
+function normalizePayoutProfilePayload(body) {
+  return {
+    bankName: validateMalaysianBank(body.bankName),
+    accountNumber: validateDigitString("accountNumber", body.accountNumber, {
+      minLength: 10,
+      maxLength: 16,
+    }),
+    accountName: validateRequiredString("accountName", body.accountName, { maxLength: 255 }),
+    icNumber: validateDigitString("icNumber", body.icNumber, { exactLength: 12 }),
+  };
+}
+
 module.exports = {
   ValidationError,
+  MALAYSIAN_PAYOUT_BANKS,
   validateEmail,
   validateStaffLevel,
   validateStaffStatus,
@@ -236,7 +296,9 @@ module.exports = {
   validateRequiredInteger,
   validateOptionalMediaUrls,
   validateOptionalString,
+  validateRequiredString,
   validateCatalogServiceKey,
+  normalizePayoutProfilePayload,
   normalizeShopPayload,
   normalizeServicePayload,
 };

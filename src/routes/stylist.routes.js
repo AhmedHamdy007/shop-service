@@ -14,8 +14,10 @@ const {
   validateOptionalNumber,
   validateOptionalInteger,
   validateOptionalString,
+  normalizePayoutProfilePayload,
   normalizeServicePayload,
 } = require("../utils/validation");
+const { encrypt } = require("../utils/encryption");
 const { findShopById } = require("../repositories/shopRepository");
 const { createService, findServiceById, updateServiceById } = require("../repositories/serviceRepository");
 const {
@@ -45,8 +47,14 @@ const {
   listPublicProfiles,
   listPublicProfilesByShopId,
   listProfilesByUserIds,
+  searchProfilesForInvite,
   upsertByUserId,
 } = require("../repositories/stylistProfileRepository");
+const {
+  createPayoutProfile,
+  findPayoutProfileByStylistId,
+  updatePayoutProfileByStylistId,
+} = require("../repositories/payoutProfileRepository");
 const {
   listByStylist,
   findById,
@@ -64,9 +72,23 @@ const {
 const { listReviewsByStylist } = require("../repositories/reviewRepository");
 
 const router = express.Router();
+const INTER_SERVICE_TIMEOUT_MS = 5000;
+
+async function fetchWithTimeout(url, options = {}) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), INTER_SERVICE_TIMEOUT_MS);
+  try {
+    return await fetch(url, {
+      ...options,
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
 
 async function fetchAuthJson(req, targetPath) {
-  const upstream = await fetch(`${config.authServiceUrl}${targetPath}`, {
+  const upstream = await fetchWithTimeout(`${config.authServiceUrl}${targetPath}`, {
     method: "GET",
     headers: {
       authorization: req.headers.authorization || "",
@@ -90,6 +112,57 @@ function parseListLimit(rawValue) {
 function sameUserId(a, b) {
   if (a === undefined || a === null || b === undefined || b === null) return false;
   return String(a) === String(b);
+}
+
+function httpError(status, message) {
+  const error = new Error(message);
+  error.status = status;
+  return error;
+}
+
+function encryptionError(error) {
+  if (String(error?.message || "").includes("PAYOUT_ENCRYPTION_KEY")) {
+    return httpError(503, "Payout encryption is not configured");
+  }
+  return error;
+}
+
+function payoutProfileResponse(profile) {
+  if (!profile) return null;
+  return {
+    bankName: profile.bankName,
+    accountName: profile.accountName,
+    accountNumberMasked: profile.accountNumberMasked,
+    isVerified: profile.isVerified,
+  };
+}
+
+async function upsertStripePayoutAccount(req, payload, existingProfile) {
+  const upstream = await fetchWithTimeout(`${config.bookingServiceUrl}/internal/connect/stylist-accounts`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      authorization: req.headers.authorization || "",
+      "x-request-id": req.id || "",
+    },
+    body: JSON.stringify({
+      bankName: payload.bankName,
+      accountNumber: payload.accountNumber,
+      accountName: payload.accountName,
+      icNumber: payload.icNumber,
+      existingStripeAccountId: existingProfile?.stripeAccountId || null,
+      ipAddress: req.ip,
+    }),
+  });
+
+  const body = await upstream.json().catch(() => ({}));
+  if (upstream.status !== 200 || !body?.data?.stripeAccountId) {
+    throw httpError(
+      upstream.status >= 400 && upstream.status < 600 ? upstream.status : 503,
+      body?.error || body?.message || "Unable to register payout account"
+    );
+  }
+  return body.data;
 }
 
 async function getOwnedShopOrRespond(req, res) {
@@ -255,9 +328,10 @@ router.post("/shops/:id/staff/invites/by-user", requireAuth, requireOwner, async
   }
 
   const staffLevel = validateStaffLevel(req.body.staffLevel);
-  const [contactResponse, existingMembership] = await Promise.all([
+  const [contactResponse, existingMembership, activeMembership] = await Promise.all([
     fetchAuthJson(req, `/internal/users/${encodeURIComponent(stylistUserId)}/contact`),
     findStaffByShopAndUser(shop.id, stylistUserId),
+    findActiveMembershipByUser(stylistUserId),
   ]);
 
   if (contactResponse.status !== 200 || !contactResponse.body?.data) {
@@ -282,6 +356,14 @@ router.post("/shops/:id/staff/invites/by-user", requireAuth, requireOwner, async
     return res.status(409).json({
       success: false,
       error: "This stylist already belongs to the shop",
+      request_id: req.id,
+    });
+  }
+
+  if (activeMembership && String(activeMembership.shopId) !== String(shop.id)) {
+    return res.status(409).json({
+      success: false,
+      error: "This stylist already belongs to another active shop",
       request_id: req.id,
     });
   }
@@ -557,6 +639,83 @@ router.get("/stylists/me/shops", requireAuth, requireStylist, async (req, res) =
   });
 });
 
+router.get("/stylist/payout-profile", requireAuth, requireStylist, async (req, res, next) => {
+  try {
+    const profile = await findPayoutProfileByStylistId(req.auth.sub);
+    if (!profile) {
+      return res.status(404).json({
+        success: false,
+        error: "Payout profile not found",
+        request_id: req.id,
+      });
+    }
+
+    return res.json({
+      success: true,
+      data: payoutProfileResponse(profile),
+      request_id: req.id,
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.post("/stylist/payout-profile", requireAuth, requireStylist, async (req, res, next) => {
+  try {
+    const payload = normalizePayoutProfilePayload(req.body || {});
+    let accountNumberEnc;
+    let icNumberEnc;
+    try {
+      accountNumberEnc = encrypt(payload.accountNumber);
+      icNumberEnc = encrypt(payload.icNumber);
+    } catch (error) {
+      throw encryptionError(error);
+    }
+
+    const existingProfile = await findPayoutProfileByStylistId(req.auth.sub, {
+      includeStripeAccountId: true,
+    });
+    const connectAccount = await upsertStripePayoutAccount(req, payload, existingProfile);
+
+    await upsertByUserId(req.auth.sub, {});
+
+    const commonPatch = {
+      stripe_account_id: connectAccount.stripeAccountId,
+      bank_name: payload.bankName,
+      account_number_enc: accountNumberEnc,
+      account_number_last4: payload.accountNumber.slice(-4),
+      account_name: payload.accountName,
+      ic_number_enc: icNumberEnc,
+      is_verified: Boolean(connectAccount.isVerified),
+    };
+
+    const profile = existingProfile
+      ? await updatePayoutProfileByStylistId(req.auth.sub, commonPatch)
+      : await createPayoutProfile({
+          stylistId: req.auth.sub,
+          stripeAccountId: connectAccount.stripeAccountId,
+          bankName: payload.bankName,
+          accountNumberEnc,
+          accountNumberLast4: payload.accountNumber.slice(-4),
+          accountName: payload.accountName,
+          icNumberEnc,
+          isVerified: Boolean(connectAccount.isVerified),
+        });
+
+    return res.status(201).json({
+      success: true,
+      message: "Payout account registered successfully",
+      data: {
+        message: "Payout account registered successfully",
+        ...payoutProfileResponse(profile),
+      },
+      request_id: req.id,
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+
 router.post("/stylists/me/shops/:shopId/leave", requireAuth, requireStylist, async (req, res) => {
   const membership = await findStaffByShopAndUser(req.params.shopId, req.auth.sub);
   if (!membership || membership.status !== "active") {
@@ -706,6 +865,7 @@ router.get("/stylists/me/profile", requireAuth, requireStylist, async (req, res)
 router.get("/stylists/search", requireAuth, requireOwner, async (req, res) => {
   const q = validateOptionalString("q", req.query.q, { maxLength: 120 });
   const limit = parseListLimit(req.query.limit);
+  const shopId = validateOptionalString("shopId", req.query.shopId, { maxLength: 120 });
 
   if (!q) {
     return res.json({
@@ -716,10 +876,13 @@ router.get("/stylists/search", requireAuth, requireOwner, async (req, res) => {
     });
   }
 
-  const authResponse = await fetchAuthJson(
-    req,
-    `/users/search?role=stylist&q=${encodeURIComponent(q)}&limit=${limit}`
-  );
+  const [authResponse, profileMatches] = await Promise.all([
+    fetchAuthJson(
+      req,
+      `/users/search?role=stylist&q=${encodeURIComponent(q)}&limit=${limit}`
+    ),
+    searchProfilesForInvite({ q, limit, excludeActiveShopId: shopId }),
+  ]);
 
   if (authResponse.status !== 200) {
     return res.status(authResponse.status === 403 ? 403 : 503).json({
@@ -730,22 +893,43 @@ router.get("/stylists/search", requireAuth, requireOwner, async (req, res) => {
   }
 
   const users = authResponse.body?.data || [];
-  const profiles = await listProfilesByUserIds(users.map((user) => user.id));
-  const profilesByUserId = Object.fromEntries(profiles.map((profile) => [String(profile.userId), profile]));
+  const userProfiles = await listProfilesByUserIds(users.map((user) => user.id));
+  const profilesByUserId = new Map(
+    [...userProfiles, ...profileMatches].map((profile) => [String(profile.userId), profile])
+  );
+  const usersById = new Map(users.map((user) => [String(user.id), user]));
+  const candidates = new Map();
 
-  const results = users.map((user) => {
-    const profile = profilesByUserId[String(user.id)];
-    return {
-      id: user.id,
-      name: profile?.displayName || user.name,
-      role: user.role,
+  function addCandidate(userId) {
+    const normalizedUserId = String(userId);
+    if (!normalizedUserId || candidates.has(normalizedUserId)) return;
+    const user = usersById.get(normalizedUserId);
+    const profile = profilesByUserId.get(normalizedUserId);
+    const activeShopId = profile?.shopId ? String(profile.shopId) : null;
+    const alreadyActiveHere = Boolean(shopId && activeShopId && activeShopId === String(shopId));
+    const alreadyActiveElsewhere = Boolean(shopId && activeShopId && activeShopId !== String(shopId));
+    if (alreadyActiveHere) return;
+
+    candidates.set(normalizedUserId, {
+      id: normalizedUserId,
+      name: profile?.displayName || user?.name || `Stylist ${normalizedUserId}`,
+      role: user?.role || "stylist",
       profileImageUrl: profile?.profileImageUrl || null,
       isPublic: profile?.isPublic ?? false,
       shopId: profile?.shopId || null,
       shopName: profile?.shopName || null,
       staffLevel: profile?.staffLevel || null,
-    };
-  });
+      availableForInvite: !alreadyActiveElsewhere,
+      inviteMessage: alreadyActiveElsewhere
+        ? `Already active at ${profile?.shopName || "another shop"}`
+        : null,
+    });
+  }
+
+  users.forEach((user) => addCandidate(user.id));
+  profileMatches.forEach((profile) => addCandidate(profile.userId));
+
+  const results = [...candidates.values()].slice(0, limit);
 
   return res.json({
     success: true,
@@ -757,7 +941,7 @@ router.get("/stylists/search", requireAuth, requireOwner, async (req, res) => {
 
 router.get("/stylists", async (req, res, next) => {
   try {
-    const stylists = await listPublicProfiles({
+    const filters = {
       q: req.query.q || null,
       city: req.query.city || null,
       shopId: req.query.shopId || null,
@@ -765,7 +949,12 @@ router.get("/stylists", async (req, res, next) => {
         req.query.staffLevel === undefined ? null : validateStaffLevel(req.query.staffLevel),
       sort: req.query.sort || "newest",
       limit: parseListLimit(req.query.limit),
-    });
+    };
+    if (req.query.serviceName !== undefined) {
+      filters.serviceName = req.query.serviceName || null;
+    }
+
+    const stylists = await listPublicProfiles(filters);
 
     return res.json({
       success: true,
@@ -797,6 +986,33 @@ router.get("/shops/:id/stylists/public", async (req, res, next) => {
       success: true,
       count: stylists.length,
       data: stylists,
+      request_id: req.id,
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.get("/internal/stylists/:stylistId/payout-profile", async (req, res, next) => {
+  try {
+    const profile = await findPayoutProfileByStylistId(req.params.stylistId, {
+      includeStripeAccountId: true,
+    });
+    if (!profile) {
+      return res.status(404).json({
+        success: false,
+        error: "Payout profile not found",
+        request_id: req.id,
+      });
+    }
+
+    return res.json({
+      success: true,
+      data: {
+        stylistId: profile.stylistId,
+        stripeAccountId: profile.stripeAccountId,
+        isVerified: profile.isVerified,
+      },
       request_id: req.id,
     });
   } catch (error) {
@@ -854,6 +1070,12 @@ router.patch("/stylists/me/profile", requireAuth, requireStylist, async (req, re
   if (Object.prototype.hasOwnProperty.call(req.body, "isPublic")) {
     patch.is_public = validateOptionalBoolean("isPublic", req.body.isPublic);
   }
+  if (Object.prototype.hasOwnProperty.call(req.body, "depositRequired")) {
+    patch.deposit_required = validateOptionalBoolean("depositRequired", req.body.depositRequired);
+  }
+  if (Object.prototype.hasOwnProperty.call(req.body, "deposit_required")) {
+    patch.deposit_required = validateOptionalBoolean("deposit_required", req.body.deposit_required);
+  }
   if (Object.prototype.hasOwnProperty.call(req.body, "profileImageUrl")) {
     // LEGACY: migrate this field to { url, publicId } object
     patch.profile_image_url = validateImageSource(req.body.profileImageUrl, "profileImageUrl");
@@ -867,6 +1089,40 @@ router.patch("/stylists/me/profile", requireAuth, requireStylist, async (req, re
   }
 
   const updated = await upsertByUserId(req.auth.sub, patch);
+  return res.json({
+    success: true,
+    data: updated,
+    request_id: req.id,
+  });
+});
+
+router.patch("/stylists/:userId", requireAuth, requireStylist, async (req, res) => {
+  if (!sameUserId(req.params.userId, req.auth.sub)) {
+    return res.status(403).json({
+      success: false,
+      error: "You can only update your own stylist settings",
+      request_id: req.id,
+    });
+  }
+
+  if (
+    !Object.prototype.hasOwnProperty.call(req.body, "depositRequired") &&
+    !Object.prototype.hasOwnProperty.call(req.body, "deposit_required")
+  ) {
+    return res.status(400).json({
+      success: false,
+      error: "depositRequired is required",
+      request_id: req.id,
+    });
+  }
+
+  const depositRequired = Object.prototype.hasOwnProperty.call(req.body, "depositRequired")
+    ? req.body.depositRequired
+    : req.body.deposit_required;
+  const updated = await upsertByUserId(req.auth.sub, {
+    deposit_required: validateOptionalBoolean("depositRequired", depositRequired),
+  });
+
   return res.json({
     success: true,
     data: updated,

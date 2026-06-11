@@ -12,9 +12,23 @@ function readRequiredKey(filePath) {
 }
 
 const publicKey = readRequiredKey(config.jwtPublicKeyPath);
+const AUTH_LOOKUP_TIMEOUT_MS = 5000;
+
+async function fetchWithTimeout(url, options = {}) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), AUTH_LOOKUP_TIMEOUT_MS);
+  try {
+    return await fetch(url, {
+      ...options,
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
 
 async function fetchCurrentUser(req) {
-  const upstream = await fetch(`${config.authServiceUrl}/users/me`, {
+  const upstream = await fetchWithTimeout(`${config.authServiceUrl}/users/me`, {
     method: "GET",
     headers: {
       authorization: req.headers.authorization || "",
@@ -45,6 +59,10 @@ function requireAuth(req, res, next) {
       audience: config.jwtAudience,
     });
     req.auth = payload;
+    req.user = {
+      id: payload.sub,
+      role: payload.role || null,
+    };
     return next();
   } catch {
     return res.status(401).json({
@@ -74,7 +92,7 @@ function requireOwner(req, res, next) {
       });
     }
 
-    if (user.role !== "owner") {
+    if (req.auth.role !== "owner") {
       return res.status(403).json({
         success: false,
         error: "Owner role required",
@@ -82,7 +100,7 @@ function requireOwner(req, res, next) {
       });
     }
 
-    req.user = user;
+    req.user = { ...user, role: req.auth.role || null };
     return next();
   })().catch(() =>
     res.status(503).json({
@@ -112,7 +130,7 @@ function requireStylist(req, res, next) {
       });
     }
 
-    if (user.role !== "stylist") {
+    if (req.auth.role !== "stylist") {
       return res.status(403).json({
         success: false,
         error: "Stylist role required",
@@ -120,7 +138,7 @@ function requireStylist(req, res, next) {
       });
     }
 
-    req.user = user;
+    req.user = { ...user, role: req.auth.role || null };
     return next();
   })().catch(() =>
     res.status(503).json({
@@ -150,15 +168,23 @@ function requireCustomer(req, res, next) {
       });
     }
 
-    if (user.role !== "customer") {
+    if (req.auth.role !== "customer") {
+      req.logger?.warn("Forbidden request blocked by shop-service RBAC", {
+        request_id: req.id,
+        user_id: user.id,
+        role: req.auth.role || null,
+        allowed_roles: ["customer"],
+        method: req.method,
+        path: req.originalUrl,
+      });
       return res.status(403).json({
         success: false,
-        error: "Customer role required",
+        error: "Access denied: insufficient role",
         request_id: req.id,
       });
     }
 
-    req.user = user;
+    req.user = { ...user, role: req.auth.role || null };
     return next();
   })().catch(() =>
     res.status(503).json({

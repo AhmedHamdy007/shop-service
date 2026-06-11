@@ -9,11 +9,48 @@ const migrationsDir = path.join(__dirname, "..", "migrations");
 const connectionString =
   process.env.DATABASE_URL || "postgresql://postgres:postgres@localhost:5432/shop_db";
 
-async function run() {
-  const pool = new Pool({ connectionString });
-  const client = await pool.connect();
+function getDatabaseName(urlString) {
+  const parsed = new URL(urlString);
+  return parsed.pathname.replace(/^\//, "");
+}
+
+function withDatabase(urlString, databaseName) {
+  const parsed = new URL(urlString);
+  parsed.pathname = `/${databaseName}`;
+  return parsed.toString();
+}
+
+async function ensureDatabaseExists() {
+  const databaseName = getDatabaseName(connectionString);
+  if (!databaseName) return;
+
+  const adminPool = new Pool({
+    connectionString: withDatabase(connectionString, "postgres"),
+  });
 
   try {
+    const result = await adminPool.query(
+      "SELECT 1 FROM pg_database WHERE datname = $1 LIMIT 1",
+      [databaseName]
+    );
+    if (result.rowCount > 0) return;
+
+    console.log(`Creating database ${databaseName} ...`);
+    await adminPool.query(`CREATE DATABASE "${databaseName.replace(/"/g, '""')}"`);
+    console.log(`Created database ${databaseName}`);
+  } finally {
+    await adminPool.end();
+  }
+}
+
+async function run() {
+  const pool = new Pool({ connectionString });
+  let client;
+  let poolClosed = false;
+  let currentMigration = null;
+
+  try {
+    client = await pool.connect();
     await client.query(`
       CREATE TABLE IF NOT EXISTS _migrations (
         id SERIAL PRIMARY KEY,
@@ -37,6 +74,7 @@ async function run() {
         continue;
       }
 
+      currentMigration = filename;
       console.log(`Applying ${filename} ...`);
       const sql = fs.readFileSync(path.join(migrationsDir, filename), "utf8");
       await client.query("BEGIN");
@@ -48,12 +86,27 @@ async function run() {
 
     console.log("Migrations complete.");
   } catch (error) {
-    await client.query("ROLLBACK");
-    console.error("Migration failed:", error.message);
+    if (error.code === "3D000") {
+      await ensureDatabaseExists();
+      await pool.end();
+      poolClosed = true;
+      return run();
+    }
+    if (client) {
+      await client.query("ROLLBACK");
+    }
+    console.error(
+      `Migration failed${currentMigration ? ` in ${currentMigration}` : ""}:`,
+      error.message
+    );
     process.exitCode = 1;
   } finally {
-    client.release();
-    await pool.end();
+    if (client) {
+      client.release();
+    }
+    if (!poolClosed) {
+      await pool.end();
+    }
   }
 }
 

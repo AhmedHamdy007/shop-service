@@ -27,6 +27,21 @@ const {
   updateShopById,
 } = require("../repositories/shopRepository");
 
+const INTER_SERVICE_TIMEOUT_MS = 5000;
+
+async function fetchWithTimeout(url, options = {}) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), INTER_SERVICE_TIMEOUT_MS);
+  try {
+    return await fetch(url, {
+      ...options,
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 function normalizeFileInput(filePathOrFile) {
   if (!filePathOrFile) throw new Error("Image file is required");
   if (typeof filePathOrFile === "string") return { path: filePathOrFile };
@@ -34,7 +49,7 @@ function normalizeFileInput(filePathOrFile) {
 }
 
 async function fetchAuthJson(targetPath, { method = "GET", authorization, body } = {}) {
-  const upstream = await fetch(`${config.authServiceUrl}${targetPath}`, {
+  const upstream = await fetchWithTimeout(`${config.authServiceUrl}${targetPath}`, {
     method,
     headers: {
       authorization: authorization || "",

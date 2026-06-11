@@ -1,6 +1,8 @@
 const express = require("express");
 const { healthCheck } = require("../db/pool");
-const { requireAuth, requireOwner, requireCustomer } = require("../middleware/auth");
+const config = require("../config");
+const { requireAuth, requireOwner } = require("../middleware/auth");
+const { customerOnly } = require("../middleware/customerOnly");
 const {
   listServiceCatalog,
   getServiceCatalogItem,
@@ -39,12 +41,20 @@ const {
   listReviewsByShop,
 } = require("../repositories/reviewRepository");
 const {
+  deleteSavedTarget,
+  listSavedTargets,
+  saveTarget,
+} = require("../repositories/saveRepository");
+const {
   findStaffByShopAndUser,
   findActiveMembershipByUser,
 } = require("../repositories/staffRepository");
 const { getByUserId } = require("../repositories/stylistProfileRepository");
 
 const router = express.Router();
+const REVIEW_ELIGIBILITY_MESSAGE =
+  "You can only leave a review after a completed appointment.";
+const INTER_SERVICE_TIMEOUT_MS = 5000;
 
 function parseListLimit(rawValue) {
   if (rawValue === undefined) return 20;
@@ -92,9 +102,181 @@ function normalizeReviewPayload(body) {
   };
 }
 
+function httpError(status, message) {
+  const error = new Error(message);
+  error.status = status;
+  return error;
+}
+
+async function fetchWithTimeout(url, options = {}) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), INTER_SERVICE_TIMEOUT_MS);
+  try {
+    return await fetch(url, {
+      ...options,
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function fetchBookingForReview(req, bookingId) {
+  if (!req.bookingReviewCache) req.bookingReviewCache = new Map();
+  const cacheKey = String(bookingId);
+  if (req.bookingReviewCache.has(cacheKey)) return req.bookingReviewCache.get(cacheKey);
+
+  const upstream = await fetchWithTimeout(`${config.bookingServiceUrl}/bookings/${encodeURIComponent(bookingId)}`, {
+    method: "GET",
+    headers: {
+      authorization: req.headers.authorization || "",
+      "x-request-id": req.id || "",
+    },
+  });
+
+  if (upstream.status !== 200) {
+    throw httpError(400, REVIEW_ELIGIBILITY_MESSAGE);
+  }
+
+  const body = await upstream.json();
+  const booking = body?.data || null;
+  req.bookingReviewCache.set(cacheKey, booking);
+  return booking;
+}
+
+async function fetchBookingsForReviews(req, bookingIds) {
+  const ids = [...new Set(bookingIds.filter(Boolean).map(String))];
+  if (ids.length === 0) return new Map();
+
+  const upstream = await fetchWithTimeout(
+    `${config.bookingServiceUrl}/internal/bookings/batch?ids=${encodeURIComponent(ids.join(","))}`,
+    {
+      method: "GET",
+      headers: {
+        authorization: req.headers.authorization || "",
+        "x-request-id": req.id || "",
+      },
+    }
+  );
+
+  if (upstream.status !== 200) return new Map();
+  const body = await upstream.json().catch(() => ({}));
+  return new Map((body?.data || []).map((booking) => [String(booking.id), booking]));
+}
+
+function assertReviewableBooking(req, booking, shopId) {
+  if (!booking) {
+    throw httpError(400, REVIEW_ELIGIBILITY_MESSAGE);
+  }
+
+  if (!sameUserId(booking.customerUserId, req.auth.sub)) {
+    throw httpError(400, REVIEW_ELIGIBILITY_MESSAGE);
+  }
+
+  if (!sameUserId(booking.shopId, shopId)) {
+    throw httpError(400, REVIEW_ELIGIBILITY_MESSAGE);
+  }
+
+  if (String(booking.status || "").toLowerCase() !== "completed") {
+    throw httpError(400, REVIEW_ELIGIBILITY_MESSAGE);
+  }
+}
+
+async function attachBookingDates(req, reviews) {
+  try {
+    const bookingsById = await fetchBookingsForReviews(
+      req,
+      reviews.map((review) => review.bookingId)
+    );
+    return reviews.map((review) => {
+      if (!review.bookingId) return review;
+      const booking = bookingsById.get(String(review.bookingId));
+      return { ...review, bookingDate: booking?.scheduledStart || review.bookingDate || null };
+    });
+  } catch {
+    return reviews;
+  }
+}
+
 function validateOptionalRating(name, value) {
   if (value === undefined || value === null || value === 0) return null;
   return validateRequiredInteger(name, value, { min: 1, max: 5 });
+}
+
+async function listMineReviews(req, res, next) {
+  try {
+    const reviews = await listReviewsByCustomer(req.user.id, {
+      limit: parseListLimit(req.query.limit),
+    });
+    const enriched = await attachBookingDates(req, reviews);
+
+    return res.json({
+      success: true,
+      count: enriched.length,
+      data: enriched,
+      request_id: req.id,
+    });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function createCustomerReview(req, res, next) {
+  try {
+    const shopId = req.params.id || req.body.shopId;
+    if (!shopId) {
+      throw httpError(400, REVIEW_ELIGIBILITY_MESSAGE);
+    }
+
+    const shop = await findShopById(shopId);
+    if (!shop || !shop.isActive) {
+      return res.status(404).json({
+        success: false,
+        error: "Shop not found",
+        request_id: req.id,
+      });
+    }
+
+    const payload = normalizeReviewPayload(req.body);
+    if (!payload.bookingId) {
+      throw httpError(400, REVIEW_ELIGIBILITY_MESSAGE);
+    }
+    if (!payload.reviewText || payload.reviewText.length < 10) {
+      throw new ValidationError("reviewText must be at least 10 characters", "reviewText");
+    }
+
+    const booking = await fetchBookingForReview(req, payload.bookingId);
+    assertReviewableBooking(req, booking, shop.id);
+    if (payload.stylistUserId && !sameUserId(payload.stylistUserId, booking.stylistUserId)) {
+      throw httpError(400, REVIEW_ELIGIBILITY_MESSAGE);
+    }
+
+    const existing = await findReviewByBookingId(payload.bookingId);
+    if (existing) {
+      throw httpError(400, REVIEW_ELIGIBILITY_MESSAGE);
+    }
+
+    const review = await createReview({
+      shopId: shop.id,
+      customerUserId: req.user.id,
+      ...payload,
+      serviceName: payload.serviceName || booking.serviceName,
+      stylistUserId: payload.stylistUserId || booking.stylistUserId,
+    });
+
+    return res.status(201).json({
+      success: true,
+      data: {
+        ...review,
+        salonName: shop.name,
+        salonAvatar: shop.imageUrl || null,
+        bookingDate: booking.scheduledStart || null,
+      },
+      request_id: req.id,
+    });
+  } catch (error) {
+    return next(error);
+  }
 }
 
 router.get("/health", (req, res) => {
@@ -130,6 +312,54 @@ router.post("/uploads/image", requireAuth, (req, res) => {
     error: "Generic image uploads are disabled. Use the role-specific image endpoints.",
     request_id: req.id,
   });
+});
+
+router.get("/saves", requireAuth, customerOnly, async (req, res, next) => {
+  try {
+    const saves = await listSavedTargets(req.user.id);
+    return res.json({
+      success: true,
+      count: saves.length,
+      data: saves,
+      request_id: req.id,
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.post("/saves", requireAuth, customerOnly, async (req, res, next) => {
+  try {
+    const saved = await saveTarget({
+      customerId: req.user.id,
+      targetId: req.body.targetId,
+      targetType: req.body.targetType,
+    });
+    return res.status(201).json({
+      success: true,
+      data: saved,
+      request_id: req.id,
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.delete("/saves/:targetId", requireAuth, customerOnly, async (req, res, next) => {
+  try {
+    await deleteSavedTarget({
+      customerId: req.user.id,
+      targetId: req.params.targetId,
+      targetType: req.query.targetType || req.body?.targetType || null,
+    });
+    return res.json({
+      success: true,
+      data: { deleted: true },
+      request_id: req.id,
+    });
+  } catch (error) {
+    return next(error);
+  }
 });
 
 router.get("/service-catalog", async (req, res, next) => {
@@ -206,22 +436,8 @@ router.get("/shops/me", requireAuth, requireOwner, async (req, res) => {
   });
 });
 
-router.get("/shops/reviews/me", requireAuth, requireCustomer, async (req, res, next) => {
-  try {
-    const reviews = await listReviewsByCustomer(req.auth.sub, {
-      limit: parseListLimit(req.query.limit),
-    });
-
-    return res.json({
-      success: true,
-      count: reviews.length,
-      data: reviews,
-      request_id: req.id,
-    });
-  } catch (error) {
-    return next(error);
-  }
-});
+router.get("/reviews/mine", requireAuth, customerOnly, listMineReviews);
+router.get("/shops/reviews/me", requireAuth, customerOnly, listMineReviews);
 
 router.get("/shops/:id", async (req, res) => {
   const shop = await findPublicShopById(req.params.id);
@@ -265,49 +481,8 @@ router.get("/shops/:id/reviews", async (req, res, next) => {
   }
 });
 
-router.post("/shops/:id/reviews", requireAuth, requireCustomer, async (req, res, next) => {
-  try {
-    const shop = await findShopById(req.params.id);
-    if (!shop || !shop.isActive) {
-      return res.status(404).json({
-        success: false,
-        error: "Shop not found",
-        request_id: req.id,
-      });
-    }
-
-    const payload = normalizeReviewPayload(req.body);
-    if (!payload.bookingId) {
-      throw new ValidationError("bookingId is required", "bookingId");
-    }
-    if (!payload.reviewText || payload.reviewText.length < 10) {
-      throw new ValidationError("reviewText must be at least 10 characters", "reviewText");
-    }
-
-    const existing = await findReviewByBookingId(payload.bookingId);
-    if (existing) {
-      return res.status(409).json({
-        success: false,
-        error: "This booking has already been reviewed",
-        request_id: req.id,
-      });
-    }
-
-    const review = await createReview({
-      shopId: shop.id,
-      customerUserId: req.auth.sub,
-      ...payload,
-    });
-
-    return res.status(201).json({
-      success: true,
-      data: review,
-      request_id: req.id,
-    });
-  } catch (error) {
-    return next(error);
-  }
-});
+router.post("/reviews", requireAuth, customerOnly, createCustomerReview);
+router.post("/shops/:id/reviews", requireAuth, customerOnly, createCustomerReview);
 
 router.post("/shops", requireAuth, requireOwner, async (req, res) => {
   const existingShop = await findActiveShopByOwnerUserId(req.auth.sub);
@@ -665,6 +840,7 @@ router.get("/internal/booking-context/shop", async (req, res, next) => {
           profileImageUrl: membership.profileImageUrl || null,
           specialties: membership.specialties || null,
           yearsExperience: membership.yearsExperience || null,
+          depositRequired: Boolean(membership.depositRequired),
         },
         serviceOffering: {
           id: service.id,
@@ -814,6 +990,49 @@ router.get("/internal/messaging-context", async (req, res, next) => {
           ownerUserId,
           stylistUserId,
           staffLevel: membership.staffLevel,
+        },
+        request_id: req.id,
+      });
+    }
+
+    if (conversationType === "customer_owner") {
+      const customerUserId =
+        initiatorRole === "customer"
+          ? initiatorUserId
+          : targetRole === "customer"
+            ? targetUserId
+            : null;
+      const ownerUserId =
+        initiatorRole === "owner"
+          ? initiatorUserId
+          : targetRole === "owner"
+            ? targetUserId
+            : null;
+
+      if (!customerUserId || !ownerUserId) {
+        return res.status(403).json({
+          success: false,
+          error: "customer_owner conversations require one customer and one owner",
+          request_id: req.id,
+        });
+      }
+
+      const shop = await findActiveShopByOwnerUserId(ownerUserId);
+      if (!shop || !shop.isActive) {
+        return res.status(404).json({
+          success: false,
+          error: "Active owner shop not found",
+          request_id: req.id,
+        });
+      }
+
+      return res.json({
+        success: true,
+        data: {
+          conversationType,
+          shopId: shop.id,
+          ownerUserId,
+          customerUserId,
         },
         request_id: req.id,
       });

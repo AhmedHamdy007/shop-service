@@ -37,6 +37,10 @@ function rowToShop(row) {
     // LEGACY: migrate this field to { url, publicId } object
     imageUrl: row.image_url,
     imagePublicId: row.image_public_id,
+    stripeAccountId: row.stripe_account_id || null,
+    stripeOnboardingDone: Boolean(row.stripe_onboarding_done),
+    payoutsEnabled: Boolean(row.payouts_enabled),
+    chargesEnabled: Boolean(row.charges_enabled),
     isActive: row.is_active,
     stylistsCount:
       row.stylists_count === undefined || row.stylists_count === null

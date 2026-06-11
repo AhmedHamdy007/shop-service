@@ -112,8 +112,8 @@ function createApp() {
   return app;
 }
 
-function signAccessToken(sub = 1) {
-  return jwt.sign({ sub }, privateKey, {
+function signAccessToken(sub = 1, role = "owner") {
+  return jwt.sign({ sub, role }, privateKey, {
     algorithm: "RS256",
     issuer: "salon-platform.auth",
     audience: "salon-platform.api",
@@ -202,7 +202,7 @@ describe("Shop Service Sprint 1 owner flows", () => {
 
     const res = await request(app)
       .post("/shops")
-      .set("Authorization", `Bearer ${signAccessToken(2)}`)
+      .set("Authorization", `Bearer ${signAccessToken(2, "stylist")}`)
       .send({
         name: "Blocked Shop",
         slug: "blocked-shop",

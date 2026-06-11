@@ -1,4 +1,4 @@
-const { query } = require("../db/pool");
+const { query, withTransaction } = require("../db/pool");
 const crypto = require("crypto");
 
 function mapPost(row) {
@@ -89,22 +89,38 @@ async function createPost({
   mediaPublicIds = [],
 }) {
   const postId = crypto.randomUUID();
-  const postResult = await query(
-    `INSERT INTO portfolio_posts (id, stylist_user_id, title, caption, category, display_order, is_published)
-     VALUES ($1, $2, $3, $4, $5, $6, $7)
-     RETURNING *`,
-    [postId, stylistUserId, title, caption, category, displayOrder, isPublished]
-  );
-  const post = mapPost(postResult.rows[0]);
-
-  for (let i = 0; i < mediaUrls.length; i += 1) {
-    await query(
-      `INSERT INTO portfolio_media (id, post_id, media_url, media_public_id, sort_order)
-       VALUES ($1, $2, $3, $4, $5)`,
-      [crypto.randomUUID(), post.id, mediaUrls[i], mediaPublicIds[i] || null, i + 1]
+  await withTransaction(async (txQuery) => {
+    await txQuery(
+      `INSERT INTO portfolio_posts (id, stylist_user_id, title, caption, category, display_order, is_published)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [postId, stylistUserId, title, caption, category, displayOrder, isPublished]
     );
-  }
-  return findById(post.id);
+
+    if (mediaUrls.length > 0) {
+      const values = [];
+      const placeholders = mediaUrls
+        .map((url, index) => {
+          values.push(
+            crypto.randomUUID(),
+            postId,
+            url,
+            mediaPublicIds[index] || null,
+            index + 1
+          );
+          const offset = index * 5;
+          return `($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, $${offset + 5})`;
+        })
+        .join(", ");
+
+      await txQuery(
+        `INSERT INTO portfolio_media (id, post_id, media_url, media_public_id, sort_order)
+         VALUES ${placeholders}`,
+        values
+      );
+    }
+  });
+
+  return findById(postId);
 }
 
 async function countByStylist(stylistUserId) {
@@ -118,32 +134,32 @@ async function countByStylist(stylistUserId) {
 }
 
 async function createPhotoEntry({ stylistUserId, photo }) {
-  const postResult = await query(
-    `INSERT INTO portfolio_posts (
-       id, stylist_user_id, title, caption, category, display_order, is_published, created_at
-     ) VALUES (
-       $1, $2, $3, $4, $5, $6, true, $7
-     )
-     RETURNING *`,
-    [
-      photo.id,
-      stylistUserId,
-      photo.category,
-      photo.caption,
-      photo.category,
-      photo.order,
-      photo.uploadedAt,
-    ]
-  );
+  await withTransaction(async (txQuery) => {
+    await txQuery(
+      `INSERT INTO portfolio_posts (
+         id, stylist_user_id, title, caption, category, display_order, is_published, created_at
+       ) VALUES (
+         $1, $2, $3, $4, $5, $6, true, $7
+       )`,
+      [
+        photo.id,
+        stylistUserId,
+        photo.category,
+        photo.caption,
+        photo.category,
+        photo.order,
+        photo.uploadedAt,
+      ]
+    );
 
-  await query(
-    `INSERT INTO portfolio_media (id, post_id, media_url, media_public_id, sort_order, created_at)
-     VALUES ($1, $2, $3, $4, 1, $5)`,
-    [crypto.randomUUID(), photo.id, photo.url, photo.publicId, photo.uploadedAt]
-  );
+    await txQuery(
+      `INSERT INTO portfolio_media (id, post_id, media_url, media_public_id, sort_order, created_at)
+       VALUES ($1, $2, $3, $4, 1, $5)`,
+      [crypto.randomUUID(), photo.id, photo.url, photo.publicId, photo.uploadedAt]
+    );
+  });
 
-  const [entry] = await attachMedia([mapPost(postResult.rows[0])]);
-  return entry;
+  return findById(photo.id);
 }
 
 async function updatePhotoImage(postId, image) {
@@ -162,14 +178,23 @@ async function updatePhotoImage(postId, image) {
 }
 
 async function reorderPortfolio(stylistUserId, orderedIds) {
-  for (let index = 0; index < orderedIds.length; index += 1) {
+  if (orderedIds.length > 0) {
+    const values = [];
+    const rows = orderedIds.map((id, index) => {
+      values.push(id, index + 1);
+      const offset = index * 2;
+      return `($${offset + 1}::uuid, $${offset + 2}::int)`;
+    });
+    values.push(stylistUserId);
+
     await query(
-      `UPDATE portfolio_posts
-       SET display_order = $3,
+      `UPDATE portfolio_posts AS pp
+       SET display_order = updates.display_order,
            updated_at = NOW()
-       WHERE id = $1
-         AND stylist_user_id = $2`,
-      [orderedIds[index], stylistUserId, index + 1]
+       FROM (VALUES ${rows.join(", ")}) AS updates(id, display_order)
+       WHERE pp.id = updates.id
+         AND pp.stylist_user_id = $${values.length}`,
+      values
     );
   }
   return listByStylist(stylistUserId, { includeUnpublished: true });
@@ -198,14 +223,25 @@ async function updatePost(postId, patch) {
 }
 
 async function replaceMedia(postId, mediaUrls) {
-  await query("DELETE FROM portfolio_media WHERE post_id = $1", [postId]);
-  for (let i = 0; i < mediaUrls.length; i += 1) {
-    await query(
+  await withTransaction(async (txQuery) => {
+    await txQuery("DELETE FROM portfolio_media WHERE post_id = $1", [postId]);
+    if (mediaUrls.length === 0) return;
+
+    const values = [];
+    const placeholders = mediaUrls
+      .map((url, index) => {
+        values.push(crypto.randomUUID(), postId, url, index + 1);
+        const offset = index * 4;
+        return `($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4})`;
+      })
+      .join(", ");
+
+    await txQuery(
       `INSERT INTO portfolio_media (id, post_id, media_url, sort_order)
-       VALUES ($1, $2, $3, $4)`,
-      [crypto.randomUUID(), postId, mediaUrls[i], i + 1]
+       VALUES ${placeholders}`,
+      values
     );
-  }
+  });
   return findById(postId);
 }
 

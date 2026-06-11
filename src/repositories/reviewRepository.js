@@ -21,6 +21,11 @@ function rowToReview(row) {
     reviewText: row.review_text,
     photoUrls: Array.isArray(row.photo_urls) ? row.photo_urls : [],
     isPublished: row.is_published,
+    salonName: row.salon_name,
+    salonAvatar: row.salon_avatar,
+    stylistName: row.stylist_name,
+    stylistAvatar: row.stylist_avatar,
+    bookingDate: row.booking_date || null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -60,10 +65,16 @@ async function listReviewsByStylist(stylistUserId, { limit = 20 } = {}) {
 
 async function listReviewsByCustomer(customerUserId, { limit = 50 } = {}) {
   const result = await query(
-    `SELECT *
-     FROM shop_reviews
-     WHERE customer_user_id = $1
-     ORDER BY created_at DESC
+    `SELECT sr.*,
+            sh.name AS salon_name,
+            sh.image_url AS salon_avatar,
+            sp.display_name AS stylist_name,
+            sp.profile_image_url AS stylist_avatar
+     FROM shop_reviews sr
+     LEFT JOIN shops sh ON sh.id = sr.shop_id
+     LEFT JOIN stylist_profiles sp ON sp.user_id::text = sr.stylist_user_id::text
+     WHERE sr.customer_user_id = $1
+     ORDER BY sr.created_at DESC
      LIMIT $2`,
     [customerUserId, normalizeLimit(limit, 50)]
   );

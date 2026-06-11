@@ -24,12 +24,13 @@ function rowToStaff(row) {
     profileImagePublicId: row.profile_image_public_id,
     specialties: row.specialties,
     yearsExperience: row.years_experience,
+    depositRequired: Boolean(row.deposit_required),
   };
 }
 
 async function listStaffByShop(shopId) {
   const result = await query(
-    `SELECT ss.*, sp.display_name, sp.profile_image_url, sp.profile_image_public_id, sp.specialties, sp.years_experience
+    `SELECT ss.*, sp.display_name, sp.profile_image_url, sp.profile_image_public_id, sp.specialties, sp.years_experience, sp.deposit_required
      FROM shop_staff ss
      LEFT JOIN stylist_profiles sp ON sp.user_id = ss.user_id
      WHERE ss.shop_id = $1
@@ -41,7 +42,7 @@ async function listStaffByShop(shopId) {
 
 async function listActiveStylistsByShop(shopId) {
   const result = await query(
-    `SELECT ss.*, sp.display_name, sp.profile_image_url, sp.profile_image_public_id, sp.specialties, sp.years_experience
+    `SELECT ss.*, sp.display_name, sp.profile_image_url, sp.profile_image_public_id, sp.specialties, sp.years_experience, sp.deposit_required
      FROM shop_staff ss
      LEFT JOIN stylist_profiles sp ON sp.user_id = ss.user_id
      WHERE ss.shop_id = $1
@@ -59,7 +60,7 @@ async function findStaffById(staffId) {
 
 async function findStaffByShopAndUser(shopId, userId) {
   const result = await query(
-    `SELECT ss.*, sp.display_name, sp.profile_image_url, sp.profile_image_public_id, sp.specialties, sp.years_experience
+    `SELECT ss.*, sp.display_name, sp.profile_image_url, sp.profile_image_public_id, sp.specialties, sp.years_experience, sp.deposit_required
      FROM shop_staff ss
      LEFT JOIN stylist_profiles sp ON sp.user_id = ss.user_id
      WHERE ss.shop_id = $1
