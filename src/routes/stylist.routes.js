@@ -862,81 +862,85 @@ router.get("/stylists/me/profile", requireAuth, requireStylist, async (req, res)
   });
 });
 
-router.get("/stylists/search", requireAuth, requireOwner, async (req, res) => {
-  const q = validateOptionalString("q", req.query.q, { maxLength: 120 });
-  const limit = parseListLimit(req.query.limit);
-  const shopId = validateOptionalString("shopId", req.query.shopId, { maxLength: 120 });
+router.get("/stylists/search", requireAuth, requireOwner, async (req, res, next) => {
+  try {
+    const q = validateOptionalString("q", req.query.q, { maxLength: 120 });
+    const limit = parseListLimit(req.query.limit);
+    const shopId = validateOptionalString("shopId", req.query.shopId, { maxLength: 120 });
 
-  if (!q) {
+    if (!q) {
+      return res.json({
+        success: true,
+        count: 0,
+        data: [],
+        request_id: req.id,
+      });
+    }
+
+    const [authResponse, profileMatches] = await Promise.all([
+      fetchAuthJson(
+        req,
+        `/users/search?role=stylist&q=${encodeURIComponent(q)}&limit=${limit}`
+      ),
+      searchProfilesForInvite({ q, limit, excludeActiveShopId: shopId }),
+    ]);
+
+    if (authResponse.status !== 200) {
+      return res.status(authResponse.status === 403 ? 403 : 503).json({
+        success: false,
+        error: authResponse.body?.error || "Unable to search stylists right now",
+        request_id: req.id,
+      });
+    }
+
+    const users = authResponse.body?.data || [];
+    const userProfiles = await listProfilesByUserIds(users.map((user) => user.id));
+    const profilesByUserId = new Map(
+      [...userProfiles, ...profileMatches].map((profile) => [String(profile.userId), profile])
+    );
+    const usersById = new Map(users.map((user) => [String(user.id), user]));
+    const candidates = new Map();
+
+    function addCandidate(userId) {
+      const normalizedUserId = String(userId);
+      if (!normalizedUserId || candidates.has(normalizedUserId)) return;
+      const user = usersById.get(normalizedUserId);
+      const profile = profilesByUserId.get(normalizedUserId);
+      const activeShopId = profile?.shopId ? String(profile.shopId) : null;
+      const alreadyActiveHere = Boolean(shopId && activeShopId && activeShopId === String(shopId));
+      const alreadyActiveElsewhere = Boolean(shopId && activeShopId && activeShopId !== String(shopId));
+      if (alreadyActiveHere) return;
+
+      candidates.set(normalizedUserId, {
+        id: normalizedUserId,
+        name: profile?.displayName || user?.name || `Stylist ${normalizedUserId}`,
+        role: user?.role || "stylist",
+        profileImageUrl: profile?.profileImageUrl || null,
+        isPublic: profile?.isPublic ?? false,
+        shopId: profile?.shopId || null,
+        shopName: profile?.shopName || null,
+        staffLevel: profile?.staffLevel || null,
+        availableForInvite: !alreadyActiveElsewhere,
+        inviteMessage: alreadyActiveElsewhere
+          ? `Already active at ${profile?.shopName || "another shop"}`
+          : null,
+      });
+    }
+
+    users.forEach((user) => addCandidate(user.id));
+    profileMatches.forEach((profile) => addCandidate(profile.userId));
+
+    const results = [...candidates.values()].slice(0, limit);
+
     return res.json({
       success: true,
-      count: 0,
-      data: [],
+      count: results.length,
+      data: results,
       request_id: req.id,
     });
+  } catch (error) {
+    return next(error);
   }
-
-  const [authResponse, profileMatches] = await Promise.all([
-    fetchAuthJson(
-      req,
-      `/users/search?role=stylist&q=${encodeURIComponent(q)}&limit=${limit}`
-    ),
-    searchProfilesForInvite({ q, limit, excludeActiveShopId: shopId }),
-  ]);
-
-  if (authResponse.status !== 200) {
-    return res.status(authResponse.status === 403 ? 403 : 503).json({
-      success: false,
-      error: authResponse.body?.error || "Unable to search stylists right now",
-      request_id: req.id,
-    });
-  }
-
-  const users = authResponse.body?.data || [];
-  const userProfiles = await listProfilesByUserIds(users.map((user) => user.id));
-  const profilesByUserId = new Map(
-    [...userProfiles, ...profileMatches].map((profile) => [String(profile.userId), profile])
-  );
-  const usersById = new Map(users.map((user) => [String(user.id), user]));
-  const candidates = new Map();
-
-  function addCandidate(userId) {
-    const normalizedUserId = String(userId);
-    if (!normalizedUserId || candidates.has(normalizedUserId)) return;
-    const user = usersById.get(normalizedUserId);
-    const profile = profilesByUserId.get(normalizedUserId);
-    const activeShopId = profile?.shopId ? String(profile.shopId) : null;
-    const alreadyActiveHere = Boolean(shopId && activeShopId && activeShopId === String(shopId));
-    const alreadyActiveElsewhere = Boolean(shopId && activeShopId && activeShopId !== String(shopId));
-    if (alreadyActiveHere) return;
-
-    candidates.set(normalizedUserId, {
-      id: normalizedUserId,
-      name: profile?.displayName || user?.name || `Stylist ${normalizedUserId}`,
-      role: user?.role || "stylist",
-      profileImageUrl: profile?.profileImageUrl || null,
-      isPublic: profile?.isPublic ?? false,
-      shopId: profile?.shopId || null,
-      shopName: profile?.shopName || null,
-      staffLevel: profile?.staffLevel || null,
-      availableForInvite: !alreadyActiveElsewhere,
-      inviteMessage: alreadyActiveElsewhere
-        ? `Already active at ${profile?.shopName || "another shop"}`
-        : null,
-    });
-  }
-
-  users.forEach((user) => addCandidate(user.id));
-  profileMatches.forEach((profile) => addCandidate(profile.userId));
-
-  const results = [...candidates.values()].slice(0, limit);
-
-  return res.json({
-    success: true,
-    count: results.length,
-    data: results,
-    request_id: req.id,
-  });
 });
 
 router.get("/stylists", async (req, res, next) => {

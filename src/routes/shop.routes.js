@@ -974,13 +974,7 @@ router.get("/internal/messaging-context", async (req, res, next) => {
         });
       }
 
-      if (!sameUserId(shop.ownerUserId, ownerUserId)) {
-        return res.status(403).json({
-          success: false,
-          error: "Owner can only message stylists from their own shop",
-          request_id: req.id,
-        });
-      }
+      // Removed shop restriction - owners can now message any stylists
 
       return res.json({
         success: true,

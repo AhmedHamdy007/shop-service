@@ -31,6 +31,10 @@ function rowToProfile(row) {
     shopCity: row.shop_city,
     shopCountry: row.shop_country,
     staffLevel: row.staff_level,
+    isBookable:
+      row.is_bookable === undefined || row.is_bookable === null
+        ? Boolean(row.shop_id && row.shop_name)
+        : Boolean(row.is_bookable),
     stripeAccountId: row.stripe_account_id || null,
     stripeOnboardingDone: Boolean(row.stripe_onboarding_done),
     payoutsEnabled: Boolean(row.payouts_enabled),
@@ -173,8 +177,6 @@ async function listPublicProfiles({
 }) {
   const filters = [
     "sp.is_public = true",
-    "ss.status = 'active'",
-    "sh.is_active = true",
   ];
   const params = [];
   const normalizedLimit = Number.isInteger(limit) ? Math.min(Math.max(limit, 1), 100) : 20;
@@ -197,10 +199,11 @@ async function listPublicProfiles({
         INNER JOIN shop_services svc
           ON svc.id = so.service_id
          AND svc.is_active = true
-        WHERE so.stylist_user_id = sp.user_id
-          AND so.shop_id = ss.shop_id
-          AND so.is_active = true
-          AND svc.name ILIKE $${serviceNameIndex}
+          WHERE so.stylist_user_id = sp.user_id
+            AND so.shop_id = ss.shop_id
+            AND so.is_active = true
+            AND sh.id IS NOT NULL
+            AND svc.name ILIKE $${serviceNameIndex}
       )`
     );
     serviceSearchRankSelect = `CASE WHEN EXISTS (
@@ -212,6 +215,7 @@ async function listPublicProfiles({
               WHERE so.stylist_user_id = sp.user_id
                 AND so.shop_id = ss.shop_id
                 AND so.is_active = true
+                AND sh.id IS NOT NULL
                 AND svc.name ILIKE $${serviceNameIndex}
             ) THEN 1 ELSE 0 END AS service_match_rank`;
     matchedServicesSelect = `COALESCE((
@@ -230,6 +234,7 @@ async function listPublicProfiles({
                 WHERE so.stylist_user_id = sp.user_id
                   AND so.shop_id = ss.shop_id
                   AND so.is_active = true
+                  AND sh.id IS NOT NULL
                   AND svc.name ILIKE $${serviceNameIndex}
                 ORDER BY svc.name ASC
                 LIMIT 4
@@ -253,6 +258,7 @@ async function listPublicProfiles({
           WHERE so.stylist_user_id = sp.user_id
             AND so.shop_id = ss.shop_id
             AND so.is_active = true
+            AND sh.id IS NOT NULL
             AND (
               svc.name ILIKE $${searchIndex}
               OR svc.category ILIKE $${searchIndex}
@@ -270,6 +276,7 @@ async function listPublicProfiles({
               WHERE so.stylist_user_id = sp.user_id
                 AND so.shop_id = ss.shop_id
                 AND so.is_active = true
+                AND sh.id IS NOT NULL
                 AND (
                   svc.name ILIKE $${searchIndex}
                   OR svc.category ILIKE $${searchIndex}
@@ -292,6 +299,7 @@ async function listPublicProfiles({
                 WHERE so.stylist_user_id = sp.user_id
                   AND so.shop_id = ss.shop_id
                   AND so.is_active = true
+                  AND sh.id IS NOT NULL
                   AND (
                     svc.name ILIKE $${searchIndex}
                     OR svc.category ILIKE $${searchIndex}
@@ -339,14 +347,18 @@ async function listPublicProfiles({
               WHERE so.stylist_user_id = sp.user_id
                 AND so.shop_id = ss.shop_id
                 AND so.is_active = true
+                AND sh.id IS NOT NULL
             ) AS service_count,
+            CASE WHEN ss.shop_id IS NOT NULL AND sh.id IS NOT NULL THEN true ELSE false END AS is_bookable,
             ${serviceSearchRankSelect},
             ${matchedServicesSelect}
      FROM stylist_profiles sp
-     INNER JOIN shop_staff ss
+     LEFT JOIN shop_staff ss
        ON ss.user_id = sp.user_id
-     INNER JOIN shops sh
+      AND ss.status = 'active'
+     LEFT JOIN shops sh
        ON sh.id = ss.shop_id
+      AND sh.is_active = true
      WHERE ${filters.join(" AND ")}
      ORDER BY service_match_rank DESC, ${orderBy}
      LIMIT $${params.length}`,

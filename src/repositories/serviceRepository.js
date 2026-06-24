@@ -96,10 +96,15 @@ async function findActiveServiceByShopAndCatalogServiceKey(shopId, catalogServic
 
 async function listServicesByShop(shopId, { includeInactive = false } = {}) {
   const result = await query(
-    `SELECT *
-     FROM shop_services
-     WHERE shop_id = $1 ${includeInactive ? "" : "AND is_active = true"}
-     ORDER BY created_at DESC`,
+    `SELECT DISTINCT s.*
+     FROM shop_services s
+     INNER JOIN stylist_service_offerings sso ON s.id = sso.service_id
+     INNER JOIN shop_staff ss ON sso.stylist_user_id = ss.user_id
+     WHERE s.shop_id = $1
+       AND ss.shop_id = $1
+       AND ss.status = 'active'
+       ${includeInactive ? "" : "AND s.is_active = true"}
+     ORDER BY s.created_at DESC`,
     [shopId]
   );
   return result.rows.map(rowToService);
